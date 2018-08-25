@@ -15,13 +15,15 @@
 {-# language PatternGuards #-}
 {-# language BangPatterns #-}
 -- {-# options_ghc -Wno-unticked-promoted-constructors #-} -- does this not actually work?
+{-# options_ghc -Wno-name-shadowing #-}
 
 module Data.Binary.Succinct.Internal where
 
 import Data.Binary.Succinct.Generics
 import Data.Binary.Succinct.Orphans ()
 
-import Control.Monad (ap)
+import Data.Maybe
+import Control.Monad (ap, (>=>))
 import Data.Proxy
 import Data.Profunctor
 import Data.Bits
@@ -33,10 +35,17 @@ import qualified Data.Vector.Storable as Storable
 import Data.Vector.Storable.ByteString
 import Data.Void
 import Data.Word
+import HaskellWorks.Data.BalancedParens as BP
 import HaskellWorks.Data.BalancedParens.RangeMinMax as BP
 import HaskellWorks.Data.RankSelect.Base.Rank0
+import HaskellWorks.Data.RankSelect.Base.Select1
+import HaskellWorks.Data.RankSelect.Base.Rank1
 import HaskellWorks.Data.RankSelect.CsPoppy as CsPoppy
 import GHC.Generics
+
+import qualified Data.Serialize.Get as S
+
+import Debug.Trace
 
 --------------------------------------------------------------------------------
 -- * Size Internals
@@ -131,15 +140,33 @@ instance Monoid Put where
 -- * Get
 --------------------------------------------------------------------------------
 
-newtype Get a = Get { runGet :: Blob -> Word64 -> Word64 -> a }
+newtype Get a = Get { runGet :: Blob -> Word64 -> Word64 -> (a, Word64) }
   deriving Functor
 
 instance Applicative Get where
-  pure a = Get $ \_ _ _ -> a
+  pure a = Get $ \_ offset _ -> (a, offset)
   (<*>) = ap
 
 instance Monad Get where
-  m >>= k = Get $ \e i j -> runGet (k (runGet m e i j)) e i j
+  m >>= k = Get $ \e i j -> let (x, i') = runGet m e i j in runGet (k x) e i' j
+
+get8 :: Get Word8
+get8 = Get $ \(Blob _ meta _ content) i j ->
+  let result = Strict.index content $ fromIntegral $ rank0 meta i in
+  --traceShow ("get8",i,result)
+  (result, i + 1)
+
+liftGetN :: Word64 -> S.Get a -> Get a
+liftGetN size g = Get $ \(Blob _ meta _ content) i j ->
+  case S.runGet g $ Strict.drop (fromIntegral $ rank0 meta i) content of
+    Left e -> error e
+    Right a -> (a, i + size)
+
+insideParens :: Get a -> Get a
+insideParens inner = Get $ \blob@(Blob _ meta shape content) i j ->
+  let close = select1 meta . fromMaybe (error "bad shape") . (BP.findClose shape) . rank1 meta $ i in
+  traceShow ("insideParens", i, rank1 meta i, close)
+  (fst $ runGet inner blob i close, close)
 
 --------------------------------------------------------------------------------
 -- * Size Annotations
@@ -206,16 +233,16 @@ instance Serializable Void
 instance Serializable ()
 
 instance Serializable Word8 where
-  serial = Serial (Exactly 1) put8 todo
+  serial = Serial (Exactly 1) put8 get8
 
 instance Serializable Word16 where
-  serial = Serial (Exactly 2) (putN 2 . word16LE) todo
+  serial = Serial (Exactly 2) (putN 2 . word16LE) (liftGetN 2 S.getWord16le)
 
 instance Serializable Word32 where
-  serial = Serial (Exactly 4) (putN 4 . word32LE) todo
+  serial = Serial (Exactly 4) (putN 4 . word32LE) (liftGetN 4 S.getWord32le)
 
 instance Serializable Word64 where
-  serial = Serial (Exactly 8) (putN 8 . word64LE) todo
+  serial = Serial (Exactly 8) (putN 8 . word64LE) (liftGetN 8 S.getWord64le)
 
 instance (Serializable a, Serializable b) => Serializable (a, b)
 instance (Serializable a, Serializable b) => Serializable (Either a b)
@@ -227,12 +254,14 @@ todo = error "haven't gotten to it yet"
 
 gserial :: forall a. Shaped Serializable a => Serial a a
 gserial = case shape @Serializable @a @SizeAnn of
-  Shape (Type (SizeAnn s) _nt cons0) -> Serial s (\a -> gput cons0 (unM1 $ from a) 0) todo where
+  Shape (Type (SizeAnn s) _nt cons0) -> Serial s (\a -> gput cons0 (unM1 $ from a) 0) (to . M1 <$> gget0 cons0) where
 
     gcons :: GShape SizeAnn 'Constructors Serializable t -> Word8
     gcons (Con _ _) = 1
     gcons (S _ l r) = gcons l + gcons r
     gcons _ = error "impossible"
+
+    -- * gput
 
     gput :: GShape SizeAnn 'Constructors Serializable t -> t a -> Word8 -> Put
     gput V v !_ = case v :: V1 a of {}
@@ -251,14 +280,34 @@ gserial = case shape @Serializable @a @SizeAnn of
       | b, Variable <- size @c = parens (put x)
       | otherwise = put x
 
+    -- * gget
+
+    gget0 :: GShape SizeAnn 'Constructors Serializable t -> Get (t a)
+    gget0 shape = get8 >>= gget shape
+
+    gget :: GShape SizeAnn 'Constructors Serializable t -> Word8 -> Get (t a)
+    gget V !_ = error "trying to decode Void"
+    gget (S _ l r) i
+      | i < gcons l = L1 <$> gget l i
+      | otherwise   = R1 <$> gget r (i - gcons l)
+    gget (Con _ c) _ = M1 <$> ggetCon c False
+
+    ggetCon :: GShape SizeAnn 'Fields Serializable t -> Bool -> Get (t a)
+    ggetCon U _ = pure U1
+    ggetCon (P _ l r) v = (:*:) <$> ggetCon l (v || isVariable (getFieldSize r)) <*> ggetCon r v
+    ggetCon (Sel _ _ds fld) b = M1 <$> ggetSel fld b
+
+    ggetSel :: GShape SizeAnn 'Field Serializable t -> Bool -> Get (t a)
+    ggetSel (K (_ :: Proxy c)) b
+      | b, Variable <- size @c = K1 <$> insideParens get
+      | otherwise = K1 <$> get
+
 isVariable :: Size -> Bool
 isVariable Variable = True
 isVariable _ = False
 
 getFieldSize :: GShape ann 'Fields p t -> Size
-getFieldSize = todo -- fell asleep
-
-
+getFieldSize _ = Variable -- todo -- fell asleep
 
 --------------------------------------------------------------------------------
 -- * Blobs
